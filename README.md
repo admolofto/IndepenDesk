@@ -14,7 +14,7 @@ Windows virtual desktops are global: pressing `Win+Ctrl+←/→` switches **all 
 - ➕ **Dynamic, independent desktop counts** — every monitor starts with 1 desktop; swiping right at the end creates a new one (up to 9 per monitor). Empty trailing desktops are removed automatically. One monitor can have 5 desktops while another has 2.
 - 🔢 **Global numbering** — desktop numbers continue across monitors (Monitor 1: 1-2-3, Monitor 2: 4-5-6). `Ctrl+Alt+digit` jumps to that desktop wherever it lives.
 - 🎞 **macOS-style slide animation**, clipped inside the monitor.
-- 🗂 **Overview screen** (`Ctrl+Alt+↑`) — Mission Control-like grid with drag & drop: move windows between desktops and monitors, move whole desktops to another monitor, right-click move menu.
+- 🗂 **Overview screen** (`Ctrl+Alt+↑`) — Mission Control-like view with a **preview of every window** (live for visible windows, last snapshot for windows on hidden desktops). Click a window to jump to it, drag it onto another desktop or onto **+** to give it a brand-new desktop, drag a desktop's title to another monitor, middle-click or × to close, type to search, right-click for the move menu.
 - 🌍 **8 languages** — English, Türkçe, Deutsch, Français, Italiano, Русский, 中文, 日本語 (auto-detected, changeable from the tray menu).
 - 🔄 **Update check** from the tray menu via GitHub Releases.
 - 🚀 **Starts with Windows** by default — can be turned off anytime from the tray menu.

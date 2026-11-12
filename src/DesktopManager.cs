@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 
 namespace IndepenDesk;
@@ -188,6 +189,7 @@ internal sealed class DesktopManager
                 {
                     if (Native.IsWindow(h)) return false;
                     _hidden.Remove(h);
+                    ThumbnailCache.Forget(h);
                     return true;
                 });
 
@@ -219,6 +221,9 @@ internal sealed class DesktopManager
     public IReadOnlyList<MonitorEntry> GetLayout()
     {
         Sync();
+        // Pencereleri z-sırasına göre (en son kullanılan önce) sırala; gizli pencereler de sırasını korur
+        var zOrder = new Dictionary<IntPtr, int>();
+        foreach (var h in EnumerateTopLevelWindows()) zOrder[h] = zOrder.Count;
         var result = new List<MonitorEntry>();
         int global = 0, ordinal = 0;
         foreach (var st in OrderedMonitors())
@@ -230,6 +235,7 @@ internal sealed class DesktopManager
                 global++;
                 var windows = st.Desktops[i]
                     .Where(Native.IsWindow)
+                    .OrderBy(h => zOrder.TryGetValue(h, out int z) ? z : int.MaxValue)
                     .Select(h =>
                     {
                         string t = Native.GetWindowTitle(h);
@@ -315,11 +321,13 @@ internal sealed class DesktopManager
 
         st.LastActive[st.Current] = Native.GetForegroundWindow();
 
-        foreach (var h in st.Desktops[st.Current].ToList())
+        // Üstteki (en son kullanılan) pencereler önce yakalanır; bütçe biterse kalanlar
+        // arka planda alınmış daha eski görüntüleriyle kalır
+        var budget = Stopwatch.StartNew();
+        foreach (var h in OrderByZ(st.Desktops[st.Current]))
         {
             if (!Native.IsWindow(h)) continue;
-            if (Native.IsWindowVisible(h) && Native.ShowWindow(h, Native.SW_HIDE))
-                _hidden.Add(h);
+            HideWindow(h, budget);
         }
 
         st.Current = target;
@@ -378,15 +386,35 @@ internal sealed class DesktopManager
         if (!Native.IsWindow(h)) return;
         if (!_monitors.TryGetValue(dstDevice, out var dst)) return;
         if (dstLocal < 0 || dstLocal >= dst.Desktops.Count) return;
+        MoveWindowCore(h, dst, dstLocal);
+    }
 
+    /// <summary>Verilen monitörde yeni bir masaüstü oluşturur ve pencereyi oraya taşır
+    /// (genel bakışta pencereyi "+" kartına bırakmak). Aktif masaüstü değişmez.</summary>
+    public bool MoveWindowToNewDesktop(IntPtr h, string dstDevice)
+    {
+        Sync();
+        if (!Native.IsWindow(h)) return false;
+        if (!_monitors.TryGetValue(dstDevice, out var dst)) return false;
+        if (dst.Desktops.Count >= MaxDesktopsPerMonitor) return false;
+        AddDesktop(dst);
+        MoveWindowCore(h, dst, dst.Desktops.Count - 1);
+        return true;
+    }
+
+    private void MoveWindowCore(IntPtr h, MonitorState dst, int dstLocal)
+    {
         string? srcDevice = null;
         foreach (var st in _monitors.Values)
             foreach (var set in st.Desktops)
                 if (set.Remove(h))
                     srcDevice = st.Device;
 
-        if (srcDevice != null && srcDevice != dstDevice)
-            RepositionWindow(h, srcDevice, dstDevice);
+        if (srcDevice != null && srcDevice != dst.Device)
+        {
+            ThumbnailCache.CaptureBeforeHide(h); // taşımadan önceki görünüm
+            RepositionWindow(h, srcDevice, dst.Device);
+        }
 
         dst.Desktops[dstLocal].Add(h);
 
@@ -395,13 +423,65 @@ internal sealed class DesktopManager
             if (!Native.IsWindowVisible(h)) Native.ShowWindow(h, Native.SW_SHOWNA);
             _hidden.Remove(h);
         }
-        else if (Native.IsWindowVisible(h) && Native.ShowWindow(h, Native.SW_HIDE))
+        else
         {
-            _hidden.Add(h);
+            HideWindow(h);
         }
 
         foreach (var st in _monitors.Values) PruneTrailingEmpty(st);
         PersistHidden();
+    }
+
+    /// <summary>Pencereyi bulunduğu masaüstüne geçerek öne getirir (genel bakışta pencereye tıklamak).</summary>
+    public void ActivateWindow(IntPtr h)
+    {
+        Sync();
+        if (!Native.IsWindow(h)) return;
+        foreach (var st in _monitors.Values)
+        {
+            int idx = st.Desktops.FindIndex(set => set.Contains(h));
+            if (idx < 0) continue;
+            st.LastActive[idx] = h;
+            if (st.Current != idx) SwitchToCore(st, idx);
+            break;
+        }
+        if (!Native.IsWindowVisible(h)) Native.ShowWindow(h, Native.SW_SHOWNA);
+        if (Native.IsIconic(h)) Native.ShowWindow(h, Native.SW_RESTORE);
+        Native.SetForegroundWindow(h);
+    }
+
+    /// <summary>Pencereye kapatma isteği gönderir (uygulama kaydetme sorusu sorabilir).</summary>
+    public static void CloseWindow(IntPtr h)
+    {
+        if (Native.IsWindow(h))
+            Native.PostMessage(h, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    /// <summary>Şu an görünür olan (aktif masaüstlerindeki) yönetilen pencereler.</summary>
+    public IEnumerable<IntPtr> VisibleWindows() =>
+        _monitors.Values
+            .SelectMany(st => st.Desktops[st.Current])
+            .Where(h => Native.IsWindow(h) && Native.IsWindowVisible(h))
+            .ToList();
+
+    /// <summary>Pencereyi gizler; gizlemeden hemen önce genel bakış için görüntüsünü yakalar.
+    /// Toplu gizlemelerde yakalama süresi bir bütçeyle sınırlanır ki geçiş gecikmesin.</summary>
+    private void HideWindow(IntPtr h, Stopwatch? budget = null)
+    {
+        if (!Native.IsWindowVisible(h)) return;
+        if (budget == null || budget.ElapsedMilliseconds < CaptureBudgetMs)
+            ThumbnailCache.CaptureBeforeHide(h);
+        if (Native.ShowWindow(h, Native.SW_HIDE))
+            _hidden.Add(h);
+    }
+
+    private const long CaptureBudgetMs = 100;
+
+    private static List<IntPtr> OrderByZ(IEnumerable<IntPtr> windows)
+    {
+        var z = new Dictionary<IntPtr, int>();
+        foreach (var h in EnumerateTopLevelWindows()) z[h] = z.Count;
+        return windows.OrderBy(h => z.TryGetValue(h, out int i) ? i : int.MaxValue).ToList();
     }
 
     /// <summary>Bir masaüstünü tüm pencereleriyle başka monitöre taşır (sonuna eklenir).</summary>
@@ -425,12 +505,13 @@ internal sealed class DesktopManager
         if (src.Current >= src.Desktops.Count) src.Current = src.Desktops.Count - 1;
 
         // Taşınan pencereleri hedef monitöre konumlandır ve gizle (eklenen masaüstü aktif değil)
+        var budget = Stopwatch.StartNew();
         foreach (var h in set.ToList())
         {
             if (!Native.IsWindow(h)) { set.Remove(h); continue; }
+            if (budget.ElapsedMilliseconds < CaptureBudgetMs) ThumbnailCache.CaptureBeforeHide(h);
             RepositionWindow(h, srcDevice, dstDevice);
-            if (Native.IsWindowVisible(h) && Native.ShowWindow(h, Native.SW_HIDE))
-                _hidden.Add(h);
+            HideWindow(h, budget);
         }
 
         dst.Desktops.Add(set);
