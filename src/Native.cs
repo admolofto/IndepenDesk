@@ -35,7 +35,18 @@ internal static class Native
     public const uint SWP_NOACTIVATE = 0x0010;
 
     public const uint WM_GETICON = 0x007F;
+    public const uint WM_CLOSE = 0x0010;
+    public const int GCLP_HICON = -14;
     public const int GCLP_HICONSM = -34;
+
+    public const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+    public const uint PW_RENDERFULLCONTENT = 0x00000002;
+
+    public const int DWM_TNP_RECTDESTINATION = 0x01;
+    public const int DWM_TNP_RECTSOURCE = 0x02;
+    public const int DWM_TNP_OPACITY = 0x04;
+    public const int DWM_TNP_VISIBLE = 0x08;
+    public const int DWM_TNP_SOURCECLIENTAREAONLY = 0x10;
 
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
@@ -81,6 +92,30 @@ internal static class Native
     [DllImport("dwmapi.dll")]
     public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
 
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out RECT pvAttribute, int cbAttribute);
+
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmRegisterThumbnail(IntPtr hwndDestination, IntPtr hwndSource, out IntPtr phThumbnailId);
+
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmUnregisterThumbnail(IntPtr hThumbnailId);
+
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmUpdateThumbnailProperties(IntPtr hThumbnailId, ref DWM_THUMBNAIL_PROPERTIES ptnProperties);
+
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmQueryThumbnailSourceSize(IntPtr hThumbnail, out SIZE pSize);
+
+    [DllImport("user32.dll")]
+    public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsHungAppWindow(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
     [DllImport("user32.dll")]
     public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
 
@@ -115,6 +150,13 @@ internal static class Native
     [DllImport("user32.dll", EntryPoint = "GetClassLongPtrW")]
     private static extern IntPtr GetClassLongPtr64(IntPtr hWnd, int nIndex);
 
+    [DllImport("user32.dll", EntryPoint = "GetClassLongW")]
+    private static extern uint GetClassLong32(IntPtr hWnd, int nIndex);
+
+    // GetClassLongPtrW yalnızca 64-bit user32'de dışa aktarılır; 32-bit'te GetClassLongW kullanılır.
+    private static IntPtr GetClassLongPtr(IntPtr hWnd, int nIndex) =>
+        IntPtr.Size == 8 ? GetClassLongPtr64(hWnd, nIndex) : new IntPtr(GetClassLong32(hWnd, nIndex));
+
     [DllImport("user32.dll")]
     public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
 
@@ -125,7 +167,26 @@ internal static class Native
     public struct POINT { public int X; public int Y; }
 
     [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+    public struct RECT
+    {
+        public int Left; public int Top; public int Right; public int Bottom;
+        public RECT(Rectangle r) { Left = r.Left; Top = r.Top; Right = r.Right; Bottom = r.Bottom; }
+        public readonly Rectangle ToRectangle() => Rectangle.FromLTRB(Left, Top, Right, Bottom);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SIZE { public int cx; public int cy; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DWM_THUMBNAIL_PROPERTIES
+    {
+        public int dwFlags;
+        public RECT rcDestination;
+        public RECT rcSource;
+        public byte opacity;
+        [MarshalAs(UnmanagedType.Bool)] public bool fVisible;
+        [MarshalAs(UnmanagedType.Bool)] public bool fSourceClientAreaOnly;
+    }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct MONITORINFOEX
@@ -176,17 +237,32 @@ internal static class Native
     }
 
     /// <summary>Pencerenin küçük simgesini alır; yanıt vermeyen uygulamalarda takılmamak için timeout'lu.</summary>
-    public static Icon? GetWindowSmallIcon(IntPtr hWnd)
+    public static Icon? GetWindowSmallIcon(IntPtr hWnd) => GetWindowIcon(hWnd, big: false);
+
+    /// <summary>Pencerenin simgesini (küçük veya büyük) alır; timeout'lu, bulamazsa sınıf simgesine düşer.</summary>
+    public static Icon? GetWindowIcon(IntPtr hWnd, bool big)
     {
         try
         {
-            SendMessageTimeout(hWnd, WM_GETICON, new IntPtr(2) /* ICON_SMALL2 */, IntPtr.Zero,
+            // ICON_BIG = 1, ICON_SMALL2 = 2
+            SendMessageTimeout(hWnd, WM_GETICON, new IntPtr(big ? 1 : 2), IntPtr.Zero,
                 0x0002 /* SMTO_ABORTIFHUNG */, 120, out IntPtr hIcon);
             if (hIcon == IntPtr.Zero)
-                hIcon = GetClassLongPtr64(hWnd, GCLP_HICONSM);
+                hIcon = GetClassLongPtr(hWnd, big ? GCLP_HICON : GCLP_HICONSM);
+            if (hIcon == IntPtr.Zero && big)
+                return GetWindowIcon(hWnd, big: false);
             if (hIcon == IntPtr.Zero) return null;
             return (Icon)Icon.FromHandle(hIcon).Clone();
         }
         catch { return null; }
+    }
+
+    /// <summary>Pencerenin görünen çerçevesi (Win10+ görünmez yeniden boyutlandırma kenarlıkları hariç).</summary>
+    public static Rectangle? GetVisibleFrame(IntPtr hWnd)
+    {
+        if (DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS, out RECT r, Marshal.SizeOf<RECT>()) == 0
+            && r.Right > r.Left && r.Bottom > r.Top)
+            return r.ToRectangle();
+        return GetWindowRect(hWnd, out r) ? r.ToRectangle() : null;
     }
 }

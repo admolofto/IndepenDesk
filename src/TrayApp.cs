@@ -45,7 +45,13 @@ internal sealed class TrayApp : ApplicationContext
         RegisterHotkeys();
 
         _manager.Sync();
-        _syncTimer.Tick += (_, _) => { if (!OverviewForm.IsOpen) _manager.Sync(); };
+        _syncTimer.Tick += (_, _) =>
+        {
+            if (OverviewForm.IsOpen) return;
+            _manager.Sync();
+            // Genel bakış önizlemeleri için görünür pencerelerin görüntüsünü yavaşça tazele
+            ThumbnailCache.BackgroundTick(_manager.VisibleWindows());
+        };
         _syncTimer.Start();
     }
 
